@@ -1,0 +1,47 @@
+name: lint
+
+# The gate for the gates. A YAML mistake in a shared workflow does not fail a
+# build downstream - it makes a step or a whole workflow silently not run, and a
+# skipped check is indistinguishable from a passing one. actionlint catches
+# reusable-workflow mistakes (undeclared inputs, wrong refs, expression errors)
+# that GitHub would otherwise only reveal on a live pipeline.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/**"
+      - ".github/actionlint.yaml"
+  pull_request:
+    paths:
+      - ".github/workflows/**"
+      - ".github/actionlint.yaml"
+
+permissions:
+  contents: read
+
+jobs:
+  actionlint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install actionlint (pinned)
+        env:
+          VERSION: 1.7.7
+          # Release tarball sha256 for actionlint_1.7.7_linux_amd64.tar.gz.
+          # A linter is part of the supply chain like any other tool: pin it.
+          SHA256: 023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757
+        run: |
+          set -euo pipefail
+          curl -fsSL -o actionlint.tgz \
+            "https://github.com/rhysd/actionlint/releases/download/v${VERSION}/actionlint_${VERSION}_linux_amd64.tar.gz"
+          echo "${SHA256}  actionlint.tgz" | sha256sum -c -
+          tar xzf actionlint.tgz actionlint
+          ./actionlint --version
+
+      - name: Run actionlint
+        run: ./actionlint -no-color

@@ -81,6 +81,10 @@ it against one project before bumping the rest.
 
 ## Validating a change
 
+`lint.yml` runs `actionlint` on every push and pull request that touches a
+workflow — the gate for the gates, because a YAML mistake here becomes a
+silently skipped step downstream, not a red build. Locally:
+
 ```bash
 actionlint -no-color .github/workflows/*.yml
 ```
