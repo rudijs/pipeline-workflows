@@ -484,10 +484,11 @@ jobs:
           # already captured what it saw, so ship those alongside the canonical
           # pair instead of leaving them in the artifact only.
           staging=$(mktemp -d)
-          for f in $(find test-results -name 'test-failed-*.png' 2>/dev/null); do
-            slug=$(basename "$(dirname "$f")" | sed -E 's/^[a-z-]+-//; s/-chromium$//')
-            cp "$f" "$staging/failure-$slug.png" 2>/dev/null || true
-          done
+          find test-results -name 'test-failed-*.png' -print0 2>/dev/null |
+            while IFS= read -r -d '' f; do
+              slug=$(basename "$(dirname "$f")" | sed -E 's/^[a-z-]+-//; s/-chromium$//')
+              cp "$f" "$staging/failure-$slug.png" 2>/dev/null || true
+            done
           for f in verify-shots/*.png; do
             [ -f "$f" ] && cp "$f" "$staging/"
           done
@@ -504,9 +505,12 @@ jobs:
           SSH_OPTS=(-i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=~/.ssh/known_hosts)
           target="${EVIDENCE_DIR}/${ENV_NAME}/verify/${SHA}"
 
+          # shellcheck disable=SC2029  # deliberate: these paths are built here and applied on the VPS
           ssh "${SSH_OPTS[@]}" "$VPS_USER@$VPS_HOST" "mkdir -p '$target'"
+          # shellcheck disable=SC2029
           scp -q "${SSH_OPTS[@]}" "$staging"/*.png "$VPS_USER@$VPS_HOST:$target/"
           # Keep the last 20 shas: enough for a before/after history, bounded.
+          # shellcheck disable=SC2029
           ssh "${SSH_OPTS[@]}" "$VPS_USER@$VPS_HOST" \
             "ls -1dt ${EVIDENCE_DIR}/${ENV_NAME}/verify/*/ 2>/dev/null | tail -n +21 | xargs -r rm -rf"
           echo "published $count screenshot(s) to ${ENV_NAME}/${SHA}"
