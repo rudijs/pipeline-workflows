@@ -13,7 +13,7 @@ change the policy that judges it.
 
 | Workflow | Lives here | Called by |
 |---|---|---|
-| `verify.yml` | ✅ yes | `rudijs/ed-app-1` |
+| `verify.yml` | ✅ yes | `rudijs/ed-app-1` · `rudijs/evidadigital.com` |
 | `merge.yml` · `deploy.yml` · `promote.yml` · `rollback.yml` · `ci.yml` | ❌ not yet | still owned by each project repo |
 
 This table is the source of truth for the migration. Do not claim a workflow is
