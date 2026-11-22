@@ -79,4 +79,12 @@ jobs:
       doctor_command: bun run verify:doctor          # proves the served build is the sha
       journeys_command: bun run verify               # the behavioural suite
       shots_command: bun run verify:shots            # evidence only, never the verdict
-    secrets: inherit
+    # Explicit, never `secrets: inherit`: the called workflow receives the
+    # secrets it uses and nothing more. A secret this repo does not have
+    # resolves to empty, and the step that uses it skips itself.
+    secrets:
+      deploy_key: ${{ secrets.DEPLOY_KEY }}
+      vps_host: ${{ secrets.VPS_HOST }}
+      vps_user: ${{ secrets.VPS_USER }}
+      vps_host_key: ${{ secrets.VPS_HOST_KEY }}
+      discord_webhook: ${{ secrets.DISCORD_RELAY_WEBHOOK_URL }}

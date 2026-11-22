@@ -105,6 +105,26 @@ on:
         type: string
         default: "bun run verify:shots"
 
+    # Explicit, never `secrets: inherit`: a called workflow should receive the
+    # secrets it uses and nothing more. All are optional because a project with
+    # no evidence_dir publishes nothing, and the Discord card is best-effort.
+    secrets:
+      deploy_key:
+        description: "SSH key used to publish the verification evidence to the VPS"
+        required: false
+      vps_host:
+        description: "The VPS that serves the screenshots"
+        required: false
+      vps_user:
+        description: "The user that owns the evidence directory"
+        required: false
+      vps_host_key:
+        description: "known_hosts entry for the VPS (StrictHostKeyChecking=yes)"
+        required: false
+      discord_webhook:
+        description: "Webhook that receives the visual evidence card"
+        required: false
+
 permissions:
   contents: read
   # The verify/<env> commit status the promotion gate reads.
@@ -467,10 +487,10 @@ jobs:
         if: always() && steps.target.outputs.work == '1'
         continue-on-error: true
         env:
-          SSH_KEY: ${{ secrets.ED_APP_DEPLOY_KEY }}
-          VPS_HOST: ${{ secrets.VPS_HOST }}
-          VPS_USER: ${{ secrets.VPS_USER }}
-          VPS_HOST_KEY: ${{ secrets.VPS_HOST_KEY }}
+          SSH_KEY: ${{ secrets.deploy_key }}
+          VPS_HOST: ${{ secrets.vps_host }}
+          VPS_USER: ${{ secrets.vps_user }}
+          VPS_HOST_KEY: ${{ secrets.vps_host_key }}
           SHA: ${{ steps.target.outputs.sha }}
           ENV_NAME: ${{ steps.target.outputs.env }}
           EVIDENCE_DIR: ${{ inputs.evidence_dir }}
@@ -821,7 +841,7 @@ jobs:
           always() && steps.target.outputs.work == '1'
         continue-on-error: true
         env:
-          WEBHOOK: ${{ secrets.DISCORD_RELAY_WEBHOOK_URL }}
+          WEBHOOK: ${{ secrets.discord_webhook }}
           SHA: ${{ steps.target.outputs.sha }}
           ENV_NAME: ${{ steps.target.outputs.env }}
           PREV_SHA: ${{ steps.target.outputs.prev_sha }}

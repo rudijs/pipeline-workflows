@@ -58,7 +58,11 @@ Fuller version: [`docs/verify-contract.md`](docs/verify-contract.md).
    `shots_command`).
 3. Pin `uses:` to a **full 40-character commit SHA**, never a branch or a tag.
    The policy is a security boundary; a moving ref is a moving boundary.
-4. Make sure the project has the commands the caller names. A missing one fails
+4. Pass the secrets explicitly (`deploy_key`, `vps_host`, `vps_user`,
+   `vps_host_key`, `discord_webhook`) — **never `secrets: inherit`**, which
+   hands the shared workflow every secret the project has. A linter flags it,
+   and it is right.
+5. Make sure the project has the commands the caller names. A missing one fails
    the run loudly — a silently skipped gate is indistinguishable from a pass.
 
 The project repo keeps the trigger, `run-name`, `permissions` and `concurrency`.
