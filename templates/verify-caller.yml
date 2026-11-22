@@ -1,0 +1,82 @@
+name: Verify
+# Named after the sha it judges, not just "Verify": several can be queued for
+# different commits, and the watchdog links a run to a deployment by this name.
+run-name: Verify ${{ inputs.sha || github.sha }}
+
+# A thin caller. The verification itself lives in rudijs/pipeline-workflows and
+# is shared by every project. Replace every <placeholder> below with this
+# project's facts, then pin `uses:` to a full 40-character commit SHA.
+#
+# Keep this file boring: the trigger, the run name, the permissions, the
+# concurrency group, and the project facts. If logic starts accumulating here,
+# it belongs in the shared workflow.
+
+on:
+  # The deploy dispatches this once it has shipped a commit, and it can be run
+  # by hand for a re-verification. NOT `workflow_run: [Deploy]`: the merge
+  # policy dispatches the deploy with GITHUB_TOKEN, and a run started that way
+  # fires no `workflow_run` event.
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Commit to verify (default: whatever the environment is running now)"
+        required: false
+        type: string
+      env:
+        description: "Environment to verify (default: auto - dev if it ran on both)"
+        required: false
+        type: choice
+        options:
+          - auto
+          - dev
+          - prod
+        default: auto
+      promotion_issue:
+        description: "The promotion issue to close when production verifies (empty for a dev verification)"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+  # The verify/<env> commit status the promotion gate reads.
+  statuses: write
+  # The deployment record proves the sha was ever on the environment.
+  deployments: read
+  pull-requests: write
+  issues: write
+
+# One verification per commit. Never two at once: the second would race the
+# first for the same dev deployment, and dev is a single shared instance.
+concurrency:
+  group: verify-${{ inputs.sha || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    uses: rudijs/pipeline-workflows/.github/workflows/verify.yml@<FULL_40_CHARACTER_SHA>
+    # A called workflow can only ever REDUCE the caller's permissions, so the
+    # job must declare what the shared workflow needs.
+    permissions:
+      contents: read
+      statuses: write
+      deployments: read
+      pull-requests: write
+      issues: write
+    with:
+      sha: ${{ inputs.sha || '' }}
+      env: ${{ inputs.env || 'auto' }}
+      promotion_issue: ${{ inputs.promotion_issue || '' }}
+
+      # --- this project's facts (no defaults exist for these) ------------
+      host_dev: <dev-host-without-scheme>            # e.g. dev-example.com
+      host_prod: <prod-host-without-scheme>          # e.g. example.com
+      evidence_dir: <absolute VPS dir or "">         # serves /verify/<sha>/ for screenshots
+
+      # --- this project's commands (the defaults are bun + playwright) ---
+      runtime: bun                                   # bun | node
+      install_command: bun install --frozen-lockfile
+      doctor_command: bun run verify:doctor          # proves the served build is the sha
+      journeys_command: bun run verify               # the behavioural suite
+      shots_command: bun run verify:shots            # evidence only, never the verdict
+    secrets: inherit

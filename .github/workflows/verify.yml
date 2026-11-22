@@ -1,0 +1,905 @@
+name: Verify
+
+# The verification phase. Deploy answers "it shipped"; this answers "it works".
+#
+# This is the SHARED implementation. Each project repo calls it from a thin
+# caller that owns the trigger, the `run-name` (`Verify <sha>` - the watchdog
+# links a run to a deployment by that name), the permissions and the
+# concurrency group. The caller passes its project facts as inputs; nothing
+# about a particular project is hardcoded here.
+#
+# It is deliberately NOT a step inside Deploy:
+#
+#   - the failure semantics differ. A deploy either happened or it did not;
+#     a verification can be UNABLE TO JUDGE (no route, TLS broken, a runner
+#     that could not install a browser). Recording that as a failed deploy
+#     would send the next reader hunting for a code defect. It is `error`
+#     (inconclusive) here, and it blocks promotion all the same.
+#   - re-verifying must not redeploy. Re-running this workflow re-runs the
+#     suite; re-running Deploy would rebuild the image and recreate containers.
+#   - the handoff names `main` explicitly (`--ref main` from deploy.yml), so
+#     the run always executes the DEFAULT BRANCH's copy of this file and a pull
+#     request can never change the verification that judges it.
+#
+# Verdicts, on the commit under test, as `verify/<env>`:
+#
+#   success  probe + doctor + journeys all passed      -> promotion may proceed
+#   failure  the artifact is live and does something wrong
+#   error    inconclusive: unreachable, TLS, stale build, runner problem
+#
+# One retry, and only per test (`retries: 1` in playwright.config.ts when CI
+# is set): a journey that fails twice is real, one that fails once and then
+# passes is flake - and it stays visible in the log instead of being averaged
+# away by a second whole-suite run.
+on:
+  # A reusable workflow: the PROJECT repo owns the trigger (workflow_dispatch,
+  # or the dispatch from its deploy.yml), this file owns the verification.
+  #
+  # Deliberately NOT `workflow_run: [Deploy]`: the merge policy dispatches the
+  # deploy with GITHUB_TOKEN, and a run started that way fires no
+  # `workflow_run` event when it completes. A `workflow_dispatch` IS exempt
+  # from that suppression, so the handoff is explicit and names the deployed sha.
+  #
+  # Everything below `env_name` that used to be a literal here - the hosts, the
+  # evidence directory, the project's own commands - is now an input. There are
+  # NO defaults for the project facts on purpose: a missing fact must fail
+  # loudly, not verify the wrong host. (A silently skipped check is
+  # indistinguishable from a passing one.)
+  workflow_call:
+    inputs:
+      sha:
+        description: "Commit to verify (empty = whatever the environment is running now)"
+        required: false
+        type: string
+        default: ""
+      env:
+        description: "Environment to verify: auto | dev | prod"
+        required: false
+        type: string
+        default: auto
+      promotion_issue:
+        description: "The promotion issue to close when production verifies (empty for a dev verification)"
+        required: false
+        type: string
+        default: ""
+
+      # --- project facts: required, no defaults -------------------------
+      host_dev:
+        description: "The dev host, without scheme (used to check the page names its environment)"
+        required: true
+        type: string
+      host_prod:
+        description: "The production host, without scheme"
+        required: true
+        type: string
+      evidence_dir:
+        description: "Absolute directory on the VPS that serves /verify/<sha>/ for screenshots (empty = skip publishing)"
+        required: false
+        type: string
+        default: ""
+
+      # --- the project's own commands (defaults fit a bun/playwright repo) ---
+      runtime:
+        description: "bun | node - which runtime setup action to run"
+        required: false
+        type: string
+        default: bun
+      install_command:
+        description: "Dependency install command"
+        required: false
+        type: string
+        default: "bun install --frozen-lockfile"
+      doctor_command:
+        description: "Assertion that the served artifact is the commit under test"
+        required: false
+        type: string
+        default: "bun run verify:doctor"
+      journeys_command:
+        description: "The behavioural suite - the only step whose failure means the artifact is wrong"
+        required: false
+        type: string
+        default: "bun run verify"
+      shots_command:
+        description: "Evidence capture (best effort, never part of the verdict)"
+        required: false
+        type: string
+        default: "bun run verify:shots"
+
+permissions:
+  contents: read
+  # The verify/<env> commit status the promotion gate reads.
+  statuses: write
+  # Reading the deployment record: it is what proves the sha was ever on the
+  # environment we are about to drive.
+  deployments: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Resolve the commit and the environment it runs on
+        id: target
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          WANTED_SHA: ${{ inputs.sha || '' }}
+          WANTED_ENV: ${{ inputs.env }}
+          HOST_DEV: ${{ inputs.host_dev }}
+          HOST_PROD: ${{ inputs.host_prod }}
+          # Optional repository variable, so the host is configuration rather
+          # than a hardcoded string. It can CONFIRM the deployment's URL, never
+          # redirect it (see below).
+          CONFIGURED_URL: ${{ vars.VERIFY_BASE_URL_DEV || '' }}
+        run: |
+          set -euo pipefail
+          sha=""
+          env_name=""
+          dep_id=""
+
+          # Which environments this run may consider. `prod` verification is
+          # reached by naming it: a promoted sha has a deployment record on
+          # BOTH environments, so "prefer dev" (the right default for a manual
+          # re-verify) would judge the dev record and post `verify/dev` for a
+          # production deploy that was never judged.
+          want_prod=0
+          want_dev=0
+          case "$WANTED_ENV" in
+            prod) want_prod=1 ;;
+            dev)  want_dev=1 ;;
+            auto) want_dev=1; want_prod=1 ;;
+            *)
+              echo "::error::unknown env input '$WANTED_ENV' (expected auto, dev or prod)"
+              exit 1
+              ;;
+          esac
+
+          # A deployment record is the proof that a commit actually landed on
+          # an environment: deploy.yml writes one per deploy, in the target
+          # environment, with the sha as the ref. `task=deploy` distinguishes
+          # it from the operator's promotion approval (task=promote).
+          if [ -n "$WANTED_SHA" ]; then
+            # An explicit sha (a manual re-verify): it must have been deployed.
+            # Resolve it to the FULL sha first - the deployments API's `sha`
+            # filter matches the full form, and actions/checkout cannot fetch a
+            # short one (git fetch does not take an abbreviation).
+            sha=$(gh api "repos/$REPO/commits/$WANTED_SHA" --jq .sha) || {
+              echo "::error::$WANTED_SHA is not a commit in this repository"
+              sha=""
+            }
+            # Dev first when both are allowed: a manual re-verify is nearly
+            # always "check this on dev". Any other environment is remembered
+            # as a fallback.
+            prod_fallback=""
+            prod_fallback_id=""
+            for row in $(gh api "repos/$REPO/deployments?sha=$sha&per_page=10" \
+              --jq '.[] | select(.task=="deploy") | "\(.id):\(.environment)"'); do
+              id="${row%%:*}"
+              env_candidate="${row##*:}"
+              case "$env_candidate" in
+                dev)  [ "$want_dev" = "1" ] || continue ;;
+                prod) [ "$want_prod" = "1" ] || continue ;;
+                *) continue ;;
+              esac
+              # `any success`, not "the newest status is success": GitHub marks
+              # every superseded deployment in an environment `inactive`, so
+              # only the newest record would ever read success - which made the
+              # "before" half of the visual pair (and any historical re-verify)
+              # look like it had never been deployed.
+              state=$(gh api "repos/$REPO/deployments/$id/statuses" \
+                --jq 'if ([.[].state] | any(. == "success")) then "success" else (.[0].state // "") end')
+              if [ "$state" = "success" ]; then
+                if [ "$env_candidate" = "dev" ]; then
+                  env_name="dev"
+                  dep_id="$id"
+                  break
+                fi
+                if [ -z "$prod_fallback" ]; then
+                  prod_fallback="$env_candidate"
+                  prod_fallback_id="$id"
+                fi
+              fi
+            done
+            if [ -z "$env_name" ]; then
+              env_name="$prod_fallback"
+              dep_id="$prod_fallback_id"
+            fi
+            if [ -z "$env_name" ]; then
+              echo "::error::$sha has no successful deployment record on ${WANTED_ENV} - nothing to verify"
+            fi
+          else
+            # No sha given: verify what the environment is running right now -
+            # the newest successful deploy record on an allowed environment.
+            # This is also what a rollback looks like (an older sha deployed
+            # deliberately): the record, not the branch tip, is the truth.
+            for row in $(gh api "repos/$REPO/deployments?per_page=20" \
+              --jq '.[] | select(.task=="deploy") | select(.environment=="dev" or .environment=="prod") | "\(.id):\(.environment):\(.sha)"'); do
+              id="${row%%:*}"
+              rest="${row#*:}"
+              env_candidate="${rest%%:*}"
+              case "$env_candidate" in
+                dev)  [ "$want_dev" = "1" ] || continue ;;
+                prod) [ "$want_prod" = "1" ] || continue ;;
+                *) continue ;;
+              esac
+              sha_candidate="${rest##*:}"
+              # `any success`, not "the newest status is success": GitHub marks
+              # every superseded deployment in an environment `inactive`, so
+              # only the newest record would ever read success - which made the
+              # "before" half of the visual pair (and any historical re-verify)
+              # look like it had never been deployed.
+              state=$(gh api "repos/$REPO/deployments/$id/statuses" \
+                --jq 'if ([.[].state] | any(. == "success")) then "success" else (.[0].state // "") end')
+              if [ "$state" = "success" ]; then
+                sha="$sha_candidate"
+                env_name="$env_candidate"
+                dep_id="$id"
+                break
+              fi
+            done
+            if [ -z "$sha" ]; then
+              echo "::error::no successful deployment record on ${WANTED_ENV}"
+            fi
+          fi
+
+          echo "resolved sha=$sha env=$env_name deployment=$dep_id"
+
+          # Where the environment is served. Two independent sources, in
+          # order of authority:
+          #
+          #   1. the deployment record's `environment_url` - the URL the deploy
+          #      itself recorded, i.e. what was actually deployed where;
+          #   2. a host map keyed on the environment, for records written
+          #      before deploy.yml started recording the URL.
+          #
+          # A repository variable (VERIFY_BASE_URL_DEV) may still be set, but
+          # it can only CONFIRM this, never redirect it. An override that
+          # disagrees is refused: driving a host the deployment did not name
+          # would report on the wrong site, and a green verdict for a site
+          # nobody deployed is worse than an inconclusive (2026-11-19: an
+          # override produced a probe failure that read like a code defect).
+          expected_host=""
+          if [ "$env_name" = "prod" ]; then
+            expected_host="$HOST_PROD"
+          elif [ "$env_name" = "dev" ]; then
+            expected_host="$HOST_DEV"
+          fi
+
+          recorded_url=""
+          if [ -n "$dep_id" ]; then
+            # `|| true`: a deleted or unreadable record must degrade to the
+            # host map, not fail the run before it can report a verdict.
+            recorded_url=$(gh api "repos/$REPO/deployments/$dep_id/statuses" \
+              --jq '[.[] | .environment_url] | map(select(. != null and . != "")) | .[0] // ""' || true)
+          fi
+
+          url=""
+          url_source=""
+          if [ -n "$recorded_url" ]; then
+            url="$recorded_url"
+            url_source="the deployment record for $env_name"
+          elif [ -n "$expected_host" ]; then
+            url="https://$expected_host/"
+            url_source="the $env_name host map (that record carries no URL)"
+          fi
+
+          trim_slash() { printf '%s' "$1" | sed -E 's#/+$##'; }
+
+          conflict=0
+          if [ -n "${CONFIGURED_URL:-}" ]; then
+            if [ -z "$url" ]; then
+              url="$CONFIGURED_URL"
+              url_source="VERIFY_BASE_URL_DEV (nothing in the record to check it against)"
+              echo "::warning::no deployment URL for ${env_name:-an unknown environment}; trusting VERIFY_BASE_URL_DEV=$CONFIGURED_URL"
+            elif [ "$(trim_slash "$CONFIGURED_URL")" = "$(trim_slash "$url")" ]; then
+              url_source="$url_source, confirmed by VERIFY_BASE_URL_DEV"
+            else
+              conflict=1
+              echo "::error::VERIFY_BASE_URL_DEV=$CONFIGURED_URL disagrees with $url ($url_source) - refusing to verify a site this deployment did not name"
+            fi
+          fi
+
+          echo "verify target: ${url:-<none>} - from $url_source"
+
+          # `work=0` means there is nothing to drive: the commit was never
+          # deployed to an environment this run may judge (inconclusive), or
+          # the configured URL disagrees with the deployment (a configuration
+          # fault, not a code defect). Burning a runner to curl an empty or
+          # foreign URL would only produce a confusing second error.
+          work=1
+          if [ -z "$env_name" ]; then
+            work=0
+          elif [ "$conflict" = "1" ] || [ -z "$url" ]; then
+            work=0
+          fi
+
+          # The commit that was live on this environment *before* this one: the
+          # "before" half of the visual pair. Best-effort - a first deploy, or a
+          # sha that never produced screenshots, simply has no before.
+          prev_sha=""
+          if [ -n "$sha" ] && [ -n "$env_name" ]; then
+            for row in $(gh api "repos/$REPO/deployments?environment=$env_name&per_page=20" \
+              --jq '.[] | select(.task=="deploy") | "\(.id):\(.sha)"'); do
+              id="${row%%:*}"
+              cand="${row##*:}"
+              [ "$cand" = "$sha" ] && continue
+              # `any success`, not "the newest status is success": GitHub marks
+              # every superseded deployment in an environment `inactive`, so
+              # only the newest record would ever read success - which made the
+              # "before" half of the visual pair (and any historical re-verify)
+              # look like it had never been deployed.
+              state=$(gh api "repos/$REPO/deployments/$id/statuses" \
+                --jq 'if ([.[].state] | any(. == "success")) then "success" else (.[0].state // "") end')
+              if [ "$state" = "success" ]; then
+                prev_sha="$cand"
+                break
+              fi
+            done
+          fi
+          echo "previous on $env_name: ${prev_sha:-<none>}"
+
+          {
+            echo "sha=$sha"
+            echo "env=$env_name"
+            echo "url=${url:-}"
+            echo "url_source=$url_source"
+            echo "host=$expected_host"
+            echo "prev_sha=$prev_sha"
+            echo "conflict=$conflict"
+            echo "work=$work"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check out the commit under test
+        if: steps.target.outputs.work == '1'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ steps.target.outputs.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        if: steps.target.outputs.work == '1' && inputs.runtime == 'bun'
+        with:
+          # Pinned, not `latest`: the committed lockfile is version 2 and bun
+          # < 1.4 cannot read it (same pin as ci.yml).
+          bun-version: "1.4.4"
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        if: steps.target.outputs.work == '1' && inputs.runtime == 'node'
+        with:
+          node-version: "22"
+
+      # The browser is ~100 MB and changes rarely; key it on the lockfile so it
+      # is restored on every run after the first.
+      - name: Cache the Playwright browser
+        if: steps.target.outputs.work == '1'
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ inputs.runtime }}-${{ hashFiles('bun.lock', 'package-lock.json') }}
+
+      # The install itself is infrastructure, not a verdict about the code:
+      # a runner that cannot install a browser must read as inconclusive.
+      - name: Install dependencies and the browser
+        id: install
+        if: steps.target.outputs.work == '1'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          ${{ inputs.install_command }}
+          ${{ inputs.runtime == 'node' && 'npx' || 'bunx' }} playwright install --with-deps chromium
+
+      # "Is this deployment worth driving at all?" - reachable, TLS valid.
+      # Bounded: 10 attempts over ~50s. A permanently dead route is not a code
+      # defect (2026-11-19: Traefik was down for three days and a 45-retry loop
+      # in deploy.yml turned it into a 27-minute red deploy).
+      - name: Probe the route
+        id: probe
+        if: steps.target.outputs.work == '1' && steps.install.outcome == 'success'
+        continue-on-error: true
+        env:
+          URL: ${{ steps.target.outputs.url }}
+        run: |
+          set -uo pipefail
+          code=000
+          for i in $(seq 1 10); do
+            code=$(curl -sS -o /dev/null -w '%{http_code}' -m 10 "$URL" 2>/dev/null) || code=000
+            if [ "$code" = "200" ]; then
+              echo "reachable: $URL -> 200 (attempt $i)"
+              exit 0
+            fi
+            echo "attempt $i: $URL -> $code"
+            sleep 5
+          done
+          echo "::error::$URL is not reachable (last code $code) - cannot verify anything"
+          exit 1
+
+      # The doctor asserts the SERVED artifact is the commit we are judging,
+      # AND that the page names the environment we meant to drive. A stale
+      # container, a cached page, or a host that is serving another
+      # environment's build with the same sha would otherwise make every
+      # journey result meaningless. Its failure is inconclusive, not failure:
+      # a wrong build on the wrong host is a deployment problem, not a code
+      # defect in this commit.
+      - name: Doctor (served build matches the commit and the environment?)
+        id: doctor
+        if: steps.probe.outcome == 'success'
+        continue-on-error: true
+        env:
+          EXPECT_BUILD_SHA: ${{ steps.target.outputs.sha }}
+          EXPECT_DEPLOY_HOST: ${{ steps.target.outputs.host }}
+          VERIFY_BASE_URL: ${{ steps.target.outputs.url }}
+        run: ${{ inputs.doctor_command }}
+
+      # The user path. This is the only step whose failure means "the artifact
+      # is live and wrong".
+      - name: Journeys
+        id: journeys
+        if: steps.probe.outcome == 'success' && steps.doctor.outcome == 'success'
+        continue-on-error: true
+        env:
+          EXPECT_BUILD_SHA: ${{ steps.target.outputs.sha }}
+          VERIFY_BASE_URL: ${{ steps.target.outputs.url }}
+        run: ${{ inputs.journeys_command }} 2>&1 | tee verify.log
+
+      # Evidence for the human, not part of the verdict: a full-page picture of
+      # the deployed app, before and after this deploy. `continue-on-error`
+      # because a missing screenshot is a missing convenience, not a broken
+      # artifact - and because this step drives the whole page, including the
+      # font CDN the journeys deliberately block.
+      - name: Capture screenshots
+        id: shots
+        if: always() && steps.probe.outcome == 'success'
+        continue-on-error: true
+        env:
+          VERIFY_BASE_URL: ${{ steps.target.outputs.url }}
+        run: ${{ inputs.shots_command }}
+
+      # Publish into the app's own nginx (`/verify/<sha>/…`, a read-only mount
+      # set up by deploy.sh) so the images are a public https URL - which is
+      # what lets BOTH the GitHub comment and the Discord card render them. A
+      # private repo cannot show a committed image in a comment: GitHub's camo
+      # proxy fetches server-side, without the reader's credentials.
+      - name: Publish the screenshots
+        id: publish
+        if: always() && steps.target.outputs.work == '1'
+        continue-on-error: true
+        env:
+          SSH_KEY: ${{ secrets.ED_APP_DEPLOY_KEY }}
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_HOST_KEY: ${{ secrets.VPS_HOST_KEY }}
+          SHA: ${{ steps.target.outputs.sha }}
+          ENV_NAME: ${{ steps.target.outputs.env }}
+          EVIDENCE_DIR: ${{ inputs.evidence_dir }}
+        run: |
+          set -uo pipefail
+          if [ -z "${EVIDENCE_DIR:-}" ]; then
+            echo "no evidence_dir is configured for this project - skipping the screenshot publish"
+            exit 0
+          fi
+          # Failure screenshots are the most valuable ones: a failing journey
+          # already captured what it saw, so ship those alongside the canonical
+          # pair instead of leaving them in the artifact only.
+          staging=$(mktemp -d)
+          for f in $(find test-results -name 'test-failed-*.png' 2>/dev/null); do
+            slug=$(basename "$(dirname "$f")" | sed -E 's/^[a-z-]+-//; s/-chromium$//')
+            cp "$f" "$staging/failure-$slug.png" 2>/dev/null || true
+          done
+          for f in verify-shots/*.png; do
+            [ -f "$f" ] && cp "$f" "$staging/"
+          done
+          count=$(find "$staging" -name '*.png' | wc -l)
+          if [ "$count" = "0" ]; then
+            echo "no screenshots to publish"
+            exit 0
+          fi
+
+          mkdir -p ~/.ssh
+          echo "$SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          echo "$VPS_HOST_KEY" > ~/.ssh/known_hosts
+          SSH_OPTS=(-i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=~/.ssh/known_hosts)
+          target="${EVIDENCE_DIR}/${ENV_NAME}/verify/${SHA}"
+
+          ssh "${SSH_OPTS[@]}" "$VPS_USER@$VPS_HOST" "mkdir -p '$target'"
+          scp -q "${SSH_OPTS[@]}" "$staging"/*.png "$VPS_USER@$VPS_HOST:$target/"
+          # Keep the last 20 shas: enough for a before/after history, bounded.
+          ssh "${SSH_OPTS[@]}" "$VPS_USER@$VPS_HOST" \
+            "ls -1dt ${EVIDENCE_DIR}/${ENV_NAME}/verify/*/ 2>/dev/null | tail -n +21 | xargs -r rm -rf"
+          echo "published $count screenshot(s) to ${ENV_NAME}/${SHA}"
+
+      - name: Upload evidence
+        if: always() && steps.target.outputs.work == '1'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: verify-${{ steps.target.outputs.env }}-${{ steps.target.outputs.sha }}
+          path: |
+            test-results/
+            verify-shots/
+            verify.log
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Verdict
+        id: verdict
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ steps.target.outputs.sha }}
+          ENV_NAME: ${{ steps.target.outputs.env }}
+          URL: ${{ steps.target.outputs.url }}
+          URL_SOURCE: ${{ steps.target.outputs.url_source }}
+          CONFLICT: ${{ steps.target.outputs.conflict }}
+          WORK: ${{ steps.target.outputs.work }}
+          PREV_SHA: ${{ steps.target.outputs.prev_sha }}
+          PROBE: ${{ steps.probe.outcome }}
+          INSTALL: ${{ steps.install.outcome }}
+          DOCTOR: ${{ steps.doctor.outcome }}
+          JOURNEYS: ${{ steps.journeys.outcome }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -uo pipefail
+
+          # How much did the suite actually prove? Playwright's own summary line
+          # ("4 passed") is the honest count - a verdict that says "journeys:
+          # success" without a number reads as green whether one journey ran or
+          # forty. Absent on failure, where the log tail is shown instead.
+          passed=""
+          if [ -f verify.log ]; then
+            passed=$(grep -Eo '[0-9]+ passed' verify.log | tail -1 || true)
+          fi
+
+          if [ -z "${SHA:-}" ] || [ -z "${ENV_NAME:-}" ]; then
+            state=error
+            reason="inconclusive: no commit to verify - the sha was not deployed to dev or prod"
+          elif [ "${CONFLICT:-}" = "1" ]; then
+            # Named explicitly: the fix is a variable, not a deploy and not a
+            # code change. Without this branch the reader gets "could not be
+            # reached" and goes hunting for a code defect in a healthy app.
+            state=error
+            reason="inconclusive: VERIFY_BASE_URL_DEV disagrees with the ${ENV_NAME} deployment (${URL}) - refusing to drive it"
+          elif [ -z "${URL:-}" ]; then
+            state=error
+            reason="inconclusive: no URL is known for ${ENV_NAME} - the deployment record carries none and the host map has no entry"
+          elif [ "${PROBE:-}" != "success" ] || [ "${INSTALL:-}" != "success" ]; then
+            state=error
+            reason="inconclusive: ${URL} could not be reached (or the runner could not install its tools)"
+          elif [ "${DOCTOR:-}" != "success" ]; then
+            state=error
+            reason="inconclusive: ${URL} is not serving ${SHA:0:7} (stale deploy, wrong host, or the doctor could not run)"
+          elif [ "${JOURNEYS:-}" != "success" ]; then
+            state=failure
+            reason="a journey failed on ${URL} - the deployed artifact does something wrong"
+          else
+            state=success
+            reason="probe, doctor and every journey passed on ${URL}"
+          fi
+
+          short="${SHA:0:7}"
+          context="verify/${ENV_NAME:-unknown}"
+
+          # The visual pair, if the screenshots made it to the app's own host.
+          # Checked with a GET rather than assumed: the publish step is
+          # best-effort, and an image that 404s renders as a broken box in both
+          # GitHub and Discord - worse than no image at all.
+          shots="${URL%/}/verify/${SHA}"
+          prev_shots="${URL%/}/verify/${PREV_SHA:-none}"
+          served() {
+            [ -n "${1:-}" ] && [ "$(curl -sS -o /dev/null -w '%{http_code}' -m 10 "$1" 2>/dev/null || true)" = "200" ]
+          }
+          before7=""; [ -n "${PREV_SHA:-}" ] && before7="${PREV_SHA:0:7}"
+          visual=""
+          if served "$shots/home-desktop.png"; then
+            bd="—"
+            if served "$prev_shots/home-desktop.png"; then
+              bd="![before]($prev_shots/home-desktop.png)"
+            fi
+            visual="| | before${before7:+ \`$before7\`} | after \`$short\` |"
+            visual+=$'\n'"|---|---|---|"
+            visual+=$'\n'"| desktop | $bd | ![after]($shots/home-desktop.png) |"
+            if served "$shots/home-mobile.png"; then
+              bm="—"
+              if served "$prev_shots/home-mobile.png"; then
+                bm="![before]($prev_shots/home-mobile.png)"
+              fi
+              visual+=$'\n'"| mobile | $bm | ![after]($shots/home-mobile.png) |"
+            fi
+          fi
+
+          # The status is the machine-readable half: promote.yml reads it.
+          # `error` is GitHub's word for "inconclusive" - there is no neutral
+          # state, and deliberately so: a status that could not be obtained
+          # must not read as success.
+          if [ -n "${SHA:-}" ] && [ -n "${ENV_NAME:-}" ]; then
+            gh api -X POST "repos/$REPO/statuses/$SHA" \
+              -f state="$state" \
+              -f context="$context" \
+              -f description="${reason:0:140}" \
+              -f target_url="$RUN_URL" >/dev/null
+            echo "posted $context=$state on $SHA"
+          fi
+
+          # The human-readable half: one comment on the linked issue (so the
+          # audit trail survives), text first, evidence second.
+          pr=""
+          pr=$(gh api "repos/$REPO/commits/$SHA/pulls" --jq '.[0].number // ""' 2>/dev/null || true)
+          if [ -z "$pr" ]; then
+            msg=$(gh api "repos/$REPO/commits/$SHA" --jq .commit.message 2>/dev/null || true)
+            pr=$(printf '%s' "$msg" | grep -oE 'Merge pull request #[0-9]+' | head -1 | grep -oE '[0-9]+' || true)
+          fi
+          issue=""
+          if [ -n "$pr" ]; then
+            body=$(gh pr view "$pr" --repo "$REPO" --json body --jq .body 2>/dev/null || true)
+            issue=$(printf '%s' "$body" | grep -oE '(Closes|Fixes|Resolves) #[0-9]+' | head -1 | grep -oE '[0-9]+' || true)
+          fi
+          target_issue="${issue:-$pr}"
+
+          if [ -n "$target_issue" ]; then
+            # Built as markdown first, then wrapped with jq: a Playwright log
+            # contains quotes and backslashes, and hand-assembled JSON breaks
+            # on the first one of those.
+            md=$(mktemp)
+            {
+              echo "### \`$context\` — **$state** on \`$short\`"
+              echo
+              echo "$reason"
+              echo
+              # The target belongs in the verdict: "the deployment could not be
+              # reached" is useless without saying WHICH host, and on
+              # 2026-11-19 that gap made an operator-side URL override read like
+              # a code defect.
+              echo "| target | value |"
+              echo "|---|---|"
+              echo "| url | ${URL:-unknown} |"
+              echo "| url from | ${URL_SOURCE:-unknown} |"
+              echo
+              if [ -n "$visual" ]; then
+                echo "$visual"
+                echo
+              fi
+              echo "| step | result |"
+              echo "|---|---|"
+              echo "| probe | ${PROBE:-n/a} |"
+              echo "| doctor | ${DOCTOR:-n/a} |"
+              echo "| journeys | ${JOURNEYS:-n/a}${passed:+ ($passed)} |"
+              if [ "$state" != "success" ] && [ -f verify.log ]; then
+                echo
+                echo '```'
+                tail -n 25 verify.log
+                echo '```'
+              fi
+              echo
+              echo "Evidence: ${RUN_URL}#artifacts · run: ${RUN_URL}"
+            } > "$md"
+            jq -Rs '{body: .}' < "$md" | gh api -X POST "repos/$REPO/issues/$target_issue/comments" --input - >/dev/null || true
+            rm -f "$md"
+            echo "commented on #$target_issue"
+          fi
+
+          {
+            echo "### \`$context\` - $state"
+            echo
+            echo "$reason"
+            echo
+            echo "| target | value |"
+            echo "|---|---|"
+            echo "| url | ${URL:-unknown} |"
+            echo "| url from | ${URL_SOURCE:-unknown} |"
+            echo
+            echo "| step | result |"
+            echo "|---|---|"
+            echo "| probe | ${PROBE:-n/a} |"
+            echo "| doctor | ${DOCTOR:-n/a} |"
+            echo "| journeys | ${JOURNEYS:-n/a}${passed:+ ($passed)} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "state=$state" >> "$GITHUB_OUTPUT"
+          [ "$state" = "success" ] && exit 0
+          exit 1
+
+      # Completion is "merged AND verified". The merge policy now leaves the
+      # issue open, and this is the only step that closes it. Guarded on the
+      # commit still being what dev runs: a manual re-verify of an older sha
+      # must not close a reopened issue that is waiting for a newer fix.
+      - name: Close the linked issue when the deployed artifact is verified
+        if: always() && steps.verdict.outputs.state == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ steps.target.outputs.sha }}
+          ENV_NAME: ${{ steps.target.outputs.env }}
+        run: |
+          set -uo pipefail
+          if [ "$ENV_NAME" != "dev" ]; then
+            echo "verified on $ENV_NAME - closure is dev's beat only"
+            exit 0
+          fi
+          live=""
+          for id in $(gh api "repos/$REPO/deployments?environment=dev&per_page=20" --jq '.[].id'); do
+            state=$(gh api "repos/$REPO/deployments/$id/statuses" --jq '.[0].state // ""')
+            if [ "$state" = "success" ]; then
+              live=$(gh api "repos/$REPO/deployments/$id" --jq .sha)
+              break
+            fi
+          done
+          if [ "$live" != "$SHA" ]; then
+            echo "dev is running ${live:-nothing}, not $SHA - not closing the issue"
+            exit 0
+          fi
+          # Only a commit on `main` can close an issue: a preview deploy of an
+          # unmerged PR head is verified on dev too, and closing its issue would
+          # declare work complete before it merged.
+          cmp=$(gh api "repos/$REPO/compare/main...$SHA" --jq .status 2>/dev/null || true)
+          if [ "$cmp" != "behind" ] && [ "$cmp" != "identical" ]; then
+            echo "$SHA is not on main (compare says '${cmp:-unknown}') - not closing the issue"
+            exit 0
+          fi
+          pr=$(gh api "repos/$REPO/commits/$SHA/pulls" --jq '.[0].number // empty' 2>/dev/null || true)
+          if [ -z "$pr" ]; then
+            msg=$(gh api "repos/$REPO/commits/$SHA" --jq .commit.message 2>/dev/null || true)
+            pr=$(printf '%s' "$msg" | sed -n 's/.*Merge pull request #\([0-9]*\).*/\1/p' | head -1)
+          fi
+          issue=""
+          if [ -n "$pr" ]; then
+            body=$(gh api "repos/$REPO/pulls/$pr" --jq .body 2>/dev/null || true)
+            issue=$(printf '%s' "$body" | grep -oiE 'closes #[0-9]+' | head -1 | grep -oE '[0-9]+' || true)
+          fi
+          if [ -z "$issue" ]; then
+            echo "no linked issue for $SHA - nothing to close"
+            exit 0
+          fi
+          if [ "$(gh api "repos/$REPO/issues/$issue" --jq .state)" != "open" ]; then
+            echo "issue #$issue is already closed"
+            exit 0
+          fi
+          gh issue close "$issue" --repo "$REPO" --comment \
+            "Verified on dev: \`$SHA\` passed probe, doctor and journeys. Completion is merged AND verified."
+          echo "closed issue #$issue (verified $SHA)"
+
+      # The promotion's own completion beat. Production is "done" when the
+      # artifact that was promoted has been verified IN production - not when
+      # the deploy step stopped moving. This is the prod half of the same rule
+      # that closes a dev issue on `verify/dev`; deploy.yml no longer closes the
+      # promotion issue itself.
+      - name: Close the promotion issue when production is verified
+        if: >-
+          always() && inputs.promotion_issue != '' &&
+          steps.verdict.outputs.state == 'success' &&
+          steps.target.outputs.env == 'prod'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ inputs.promotion_issue }}
+          SHA: ${{ steps.target.outputs.sha }}
+        run: |
+          set -uo pipefail
+          # Guarded on production still running this sha: a later promotion
+          # supersedes this one, and closing its issue would claim a state that
+          # is no longer true.
+          live=""
+          for id in $(gh api "repos/$REPO/deployments?environment=prod&per_page=20" --jq '.[].id'); do
+            state=$(gh api "repos/$REPO/deployments/$id/statuses" --jq '.[0].state // ""')
+            if [ "$state" = "success" ]; then
+              live=$(gh api "repos/$REPO/deployments/$id" --jq .sha)
+              break
+            fi
+          done
+          if [ "$live" != "$SHA" ]; then
+            echo "production is running ${live:-nothing}, not $SHA - not closing the promotion issue"
+            exit 0
+          fi
+          if [ "$(gh api "repos/$REPO/issues/$ISSUE_NUMBER" --jq .state)" != "open" ]; then
+            echo "promotion issue #$ISSUE_NUMBER is already closed"
+            exit 0
+          fi
+          gh api "repos/$REPO/issues/$ISSUE_NUMBER/comments" --input - <<JSON
+          {"body": "**Promotion verified in production.** \`$SHA\` passed the probe, the doctor and every journey against the production host (\`verify/prod\`). Completion is merged AND verified in the environment it was promoted to."}
+          JSON
+          gh api -X PATCH "repos/$REPO/issues/$ISSUE_NUMBER" -f state=closed >/dev/null
+          echo "closed the promotion issue #$ISSUE_NUMBER (verified $SHA on prod)"
+
+      # The picture, in chat. The relay's card stays the wake signal (it is the
+      # one that mentions the bot and gets the pm admitted); this is the visual
+      # companion, so the state of the app is visible without opening a browser
+      # or leaving the channel. No mention on purpose - it must not wake an
+      # agent for something that only a human is reading.
+      # The picture, in chat. The relay's card stays the wake signal (it is the
+      # one that mentions the bot and gets the pm admitted); this is the visual
+      # companion, so the state of the app is visible without opening a browser
+      # or leaving the channel. No mention on purpose - it must not wake an
+      # agent for something that only a human is reading.
+      - name: Post the visual evidence to Discord
+        if: >-
+          always() && steps.target.outputs.work == '1'
+        continue-on-error: true
+        env:
+          WEBHOOK: ${{ secrets.DISCORD_RELAY_WEBHOOK_URL }}
+          SHA: ${{ steps.target.outputs.sha }}
+          ENV_NAME: ${{ steps.target.outputs.env }}
+          PREV_SHA: ${{ steps.target.outputs.prev_sha }}
+          URL: ${{ steps.target.outputs.url }}
+          PROBE: ${{ steps.probe.outcome }}
+          DOCTOR: ${{ steps.doctor.outcome }}
+          JOURNEYS: ${{ steps.journeys.outcome }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          if [ -z "${WEBHOOK:-}" ]; then
+            echo "DISCORD_RELAY_WEBHOOK_URL is not set - skipping the visual card"
+            exit 0
+          fi
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+          import urllib.request
+
+          hook = os.environ["WEBHOOK"]
+          sha = os.environ.get("SHA", "")
+          env_name = os.environ.get("ENV_NAME", "")
+          prev = os.environ.get("PREV_SHA", "")
+          base = (os.environ.get("URL", "") or "").rstrip("/")
+
+
+          def served(url: str) -> bool:
+              """The publish step is best-effort: only offer images that are really there."""
+              if not url:
+                  return False
+              try:
+                  with urllib.request.urlopen(url, timeout=10) as response:  # noqa: S310
+                      return response.status == 200
+              except Exception:  # noqa: BLE001 - a missing image is not an error
+                  return False
+
+
+          shots = f"{base}/verify/{sha}"
+          previous = f"{base}/verify/{prev}" if prev else ""
+          pairs = [
+              ("desktop", f"{shots}/home-desktop.png", f"{previous}/home-desktop.png"),
+              ("mobile", f"{shots}/home-mobile.png", f"{previous}/home-mobile.png"),
+          ]
+
+          embeds = []
+          for label, after, before in pairs:
+              if served(after):
+                  embeds.append({"title": f"after - {sha[:7]} - {label}", "image": {"url": after}})
+              if served(before):
+                  embeds.append({"title": f"before - {prev[:7]} - {label}", "image": {"url": before}})
+
+          if not embeds:
+              print("no screenshots are served yet - nothing to show")
+              sys.exit(0)
+
+          steps = {
+              "probe": os.environ.get("PROBE", "n/a"),
+              "doctor": os.environ.get("DOCTOR", "n/a"),
+              "journeys": os.environ.get("JOURNEYS", "n/a"),
+          }
+          verdict = "success" if all(v == "success" for v in steps.values()) else "did not pass"
+
+          payload = {
+              "content": (
+                  f"**Verify - {env_name} @ {sha[:7]}** - {verdict}\n"
+                  f"probe {steps['probe']} - doctor {steps['doctor']} - journeys {steps['journeys']}\n"
+                  f"<{os.environ.get('RUN_URL', '')}>"
+              ),
+              "embeds": embeds[:10],
+          }
+
+          request = urllib.request.Request(  # noqa: S310
+              hook,
+              data=json.dumps(payload).encode(),
+              headers={"Content-Type": "application/json", "User-Agent": "ed-app-1-verify"},
+              method="POST",
+          )
+          try:
+              with urllib.request.urlopen(request, timeout=20) as response:  # noqa: S310
+                  print(f"posted {len(embeds)} image embed(s) to Discord ({response.status})")
+          except Exception as error:  # noqa: BLE001
+              print(f"Discord post failed: {error}")
+
+          PY
