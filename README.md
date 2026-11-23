@@ -25,6 +25,44 @@ is the order in which drift costs the most: the merge policy is what turns "CI
 green" into "code on main", so two diverging copies of it are two different
 security postures.
 
+## The desired state belongs in the project repo, not in deploy.sh
+
+A project that composes its stack with a heredoc inside its deploy script has
+versioned the *script* and left the *config* unreadable: you cannot review the
+stack in a PR, diff dev against prod, or compare either to what is running.
+
+```
+deploy/compose.yml       the structure, ONE copy for every environment
+deploy/env/dev.env       the identity: host, router, rule, priority, port, network
+deploy/env/prod.env
+deploy/env/prod.pin      which commit production should be running (optional)
+deploy/render.sh         structure + identity + this run's image -> a file
+```
+
+The deploy receives the rendered file (`COMPOSE_B64` on the same stdin pipe that
+carries the script) and writes it verbatim, so what starts a container is what a
+reviewer read. The two environments differ only by their identity values - a
+structural change is one file, and it reaches production only by promotion.
+
+Adoption is testable: render both environments and `diff` them against the live
+files. Identity should be exact; a difference is either the bug you are fixing
+or drift you did not know about (it found a six-day-stale compose file with no
+verification mount, and a comment mangled by shell expansion in an unquoted
+heredoc).
+
+Three rules that are not obvious:
+
+- **Read the template from `main`, never from the target tree.** A rollback
+  targets an old commit that may predate `deploy/`, and the stack's shape must
+  not be chosen by the artifact under test. In a job with
+  `persist-credentials: false`, that means the contents API - `git fetch` fails
+  with *"could not read Username for 'https://github.com'"*.
+- **Mask the image line when comparing**, or "the shape changed" fires on every
+  deploy (the digest is part of the file) and the signal becomes noise.
+- **A pin is written after the gates, before the deploy.** Writing it after
+  success lets a failed deploy leave no trace; before, declared ≠ actual is
+  visible and reportable.
+
 ## Why this repo exists
 
 The project repos had ~112 KB of near-identical YAML, and the copies had already
