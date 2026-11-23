@@ -751,8 +751,21 @@ jobs:
             fi
           done
           if [ "$live" != "$SHA" ]; then
-            echo "dev is running ${live:-nothing}, not $SHA - not closing the issue"
-            exit 0
+            # An exact match is the common case, but not the only safe one: a
+            # commit that landed on main after $SHA moves dev forward, and the
+            # verified change is still IN what dev serves. Closing on that is
+            # correct; refusing made a verified change look unverified whenever
+            # an operator commit slipped in behind it (measured on #60).
+            # Divergence is still refused: compare reports "ahead"/"diverged"
+            # when dev does NOT contain $SHA (a rollback, a preview, a revert).
+            contained=$(gh api "repos/$REPO/compare/$SHA...$live" --jq .status 2>/dev/null || true)
+            case "$contained" in
+              behind|identical)
+                echo "dev is running $live, which contains $SHA - closing the issue" ;;
+              *)
+                echo "dev is running ${live:-nothing}, which does not contain $SHA ($contained) - not closing the issue"
+                exit 0 ;;
+            esac
           fi
           # Only a commit on `main` can close an issue: a preview deploy of an
           # unmerged PR head is verified on dev too, and closing its issue would
