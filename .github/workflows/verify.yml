@@ -658,7 +658,7 @@ jobs:
           issue=""
           if [ -n "$pr" ]; then
             body=$(gh pr view "$pr" --repo "$REPO" --json body --jq .body 2>/dev/null || true)
-            issue=$(printf '%s' "$body" | grep -oE '(Closes|Fixes|Resolves) #[0-9]+' | head -1 | grep -oE '[0-9]+' || true)
+            issue=$(printf '%s' "$body" | grep -oE '(Closes|Fixes|Resolves|Refs) #[0-9]+' | head -1 | grep -oE '[0-9]+' || true)
           fi
           target_issue="${issue:-$pr}"
 
@@ -770,7 +770,7 @@ jobs:
           issue=""
           if [ -n "$pr" ]; then
             body=$(gh api "repos/$REPO/pulls/$pr" --jq .body 2>/dev/null || true)
-            issue=$(printf '%s' "$body" | grep -oiE 'closes #[0-9]+' | head -1 | grep -oE '[0-9]+' || true)
+            issue=$(printf '%s' "$body" | grep -oiE '(closes|fixes|resolves|refs) #[0-9]+' | head -1 | grep -oE '[0-9]+' || true)
           fi
           if [ -z "$issue" ]; then
             echo "no linked issue for $SHA - nothing to close"
