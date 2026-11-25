@@ -793,8 +793,30 @@ jobs:
             echo "issue #$issue is already closed"
             exit 0
           fi
-          gh issue close "$issue" --repo "$REPO" --comment \
-            "Verified on dev: \`$SHA\` passed probe, doctor and journeys. Completion is merged AND verified."
+          # Same shape as the promotion issue below: close first (retried, and
+          # verified by reading the state back), then post the explanation. A
+          # flaky response on the comment must not leave a verified issue open -
+          # `gh issue close --comment` does both in one command, so a 502 on the
+          # comment aborted it before the close.
+          closed=0
+          for attempt in 1 2 3 4 5; do
+            gh api -X PATCH "repos/$REPO/issues/$issue" -f state=closed \
+              >/dev/null 2>&1 || true
+            state=$(gh api "repos/$REPO/issues/$issue" --jq .state 2>/dev/null || true)
+            if [ "$state" = "closed" ]; then
+              closed=1
+              break
+            fi
+            echo "attempt $attempt: issue #$issue is still '${state:-unknown}' - retrying in 5s"
+            sleep 5
+          done
+          if [ "$closed" != "1" ]; then
+            echo "::error::could not close issue #$issue after 5 attempts"
+            exit 1
+          fi
+          gh api "repos/$REPO/issues/$issue/comments" --silent --input - <<JSON || echo "WARNING: could not post the closure comment on #$issue"
+          {"body": "Verified on dev: \`$SHA\` passed probe, doctor and journeys. Completion is merged AND verified."}
+          JSON
           echo "closed issue #$issue (verified $SHA)"
 
       # The promotion's own completion beat. Production is "done" when the
@@ -833,11 +855,42 @@ jobs:
             echo "promotion issue #$ISSUE_NUMBER is already closed"
             exit 0
           fi
-          gh api "repos/$REPO/issues/$ISSUE_NUMBER/comments" --input - <<JSON
+          # CLOSE FIRST, COMMENT SECOND.
+          #
+          # The API intermittently answers a write with an empty body (observed
+          # 502s on the comments endpoint, roughly 1 in 3 on 2026-11-25). `gh`
+          # then fails to decode the response and exits non-zero - and this step
+          # runs under `bash -e`, so when the comment came first a flaky comment
+          # aborted the script BEFORE the close and left a verified promotion
+          # open. That happened on the first two promotions (issue #11).
+          #
+          # The close is the completion beat, so it runs first and is retried.
+          # The retry checks the ISSUE'S STATE, not the exit code: a write that
+          # succeeded but whose response was lost must not be retried into a
+          # duplicate close, nor reported as a failure.
+          closed=0
+          for attempt in 1 2 3 4 5; do
+            gh api -X PATCH "repos/$REPO/issues/$ISSUE_NUMBER" -f state=closed \
+              >/dev/null 2>&1 || true
+            state=$(gh api "repos/$REPO/issues/$ISSUE_NUMBER" --jq .state 2>/dev/null || true)
+            if [ "$state" = "closed" ]; then
+              closed=1
+              break
+            fi
+            echo "attempt $attempt: issue #$ISSUE_NUMBER is still '${state:-unknown}' - retrying in 5s"
+            sleep 5
+          done
+          if [ "$closed" != "1" ]; then
+            echo "::error::could not close the promotion issue #$ISSUE_NUMBER after 5 attempts"
+            exit 1
+          fi
+          echo "closed the promotion issue #$ISSUE_NUMBER (verified $SHA on prod)"
+          # The explanation, best effort. `--silent` skips decoding the
+          # response, so the empty-body flake cannot fail it; a real HTTP error
+          # is reported and does NOT un-close the issue.
+          gh api "repos/$REPO/issues/$ISSUE_NUMBER/comments" --silent --input - <<JSON || echo "WARNING: could not post the verification comment on #$ISSUE_NUMBER (the issue is closed)"
           {"body": "**Promotion verified in production.** \`$SHA\` passed the probe, the doctor and every journey against the production host (\`verify/prod\`). Completion is merged AND verified in the environment it was promoted to."}
           JSON
-          gh api -X PATCH "repos/$REPO/issues/$ISSUE_NUMBER" -f state=closed >/dev/null
-          echo "closed the promotion issue #$ISSUE_NUMBER (verified $SHA on prod)"
 
       # The picture, in chat. The relay's card stays the wake signal (it is the
       # one that mentions the bot and gets the pm admitted); this is the visual
